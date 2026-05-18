@@ -18,6 +18,7 @@ toml_prep() {
 		__TOML__=$(cat "$1")
 	else abort "config extension not supported"; fi
 }
+
 toml_get_table_names() { jq -r -e 'to_entries[] | select(.value | type == "object") | .key' <<<"$__TOML__"; }
 toml_get_table_main() { jq -r -e 'to_entries | map(select(.value | type != "object")) | from_entries' <<<"$__TOML__"; }
 toml_get_table() { jq -r -e ".\"${1}\"" <<<"$__TOML__"; }
@@ -42,12 +43,21 @@ abort() {
 	exit 1
 }
 
+# ---------------------------------------------------------------------------
+# GitLab mirror mapping for repos that may be DMCA'd off GitHub.
+# Key = "owner/repo" on GitHub, Value = URL-encoded GitLab project path.
+# ---------------------------------------------------------------------------
+declare -A GITLAB_MIRRORS=(
+	["ReVanced/revanced-patches"]="revanced%2Frevanced-patches"
+)
+
 get_rv_prebuilts() {
 	local cli_src=$1 cli_ver=$2 patches_src=$3 patches_ver=$4
 	pr "Getting prebuilts (${patches_src%/*})" >&2
 	local cl_dir=${patches_src%/*}
 	cl_dir=${TEMP_DIR}/${cl_dir,,}-rv
 	[ -d "$cl_dir" ] || mkdir "$cl_dir"
+
 	for src_ver in "$cli_src CLI $cli_ver revanced-cli" "$patches_src Patches $patches_ver patches"; do
 		set -- $src_ver
 		local src=$1 tag=$2 ver=${3-} fprefix=$4
@@ -57,6 +67,7 @@ get_rv_prebuilts() {
 		elif [ "$tag" = "Patches" ]; then
 			ext="rvp"
 		else abort unreachable; fi
+
 		local dir=${src%/*}
 		dir=${TEMP_DIR}/${dir,,}-rv
 		[ -d "$dir" ] || mkdir "$dir"
@@ -76,15 +87,46 @@ get_rv_prebuilts() {
 		file=$(find "$dir" -name "${fprefix}-${name_ver#v}.${ext}" -type f 2>/dev/null)
 		if [ -z "$file" ]; then
 			local resp asset name
-			resp=$(gh_req "$rv_rel" -) || return 1
-			if [ "$ver" = "dev" ]; then resp=$(jq -r '.[0]' <<<"$resp"); fi
-			tag_name=$(jq -r '.tag_name' <<<"$resp")
-			asset=$(jq -e -r ".assets[] | select(.name | endswith(\"$ext\"))" <<<"$resp") || return 1
-			url=$(jq -r .url <<<"$asset")
-			name=$(jq -r .name <<<"$asset")
-			file="${dir}/${name}"
-			gh_dl "$file" "$url" >&2 || return 1
-			echo "$tag: $(cut -d/ -f1 <<<"$src")/${name}  " >>"${cl_dir}/changelog.md"
+
+			# ---- Try GitHub first ----------------------------------------
+			if resp=$(gh_req "$rv_rel" -); then
+				if [ "$ver" = "dev" ]; then resp=$(jq -r '.[0]' <<<"$resp"); fi
+				tag_name=$(jq -r '.tag_name' <<<"$resp")
+				asset=$(jq -e -r ".assets[] | select(.name | endswith(\"$ext\"))" <<<"$resp") || return 1
+				url=$(jq -r .url <<<"$asset")
+				name=$(jq -r .name <<<"$asset")
+				file="${dir}/${name}"
+				gh_dl "$file" "$url" >&2 || return 1
+				echo "$tag: $(cut -d/ -f1 <<<"$src")/${name} " >>"${cl_dir}/changelog.md"
+
+			# ---- GitHub failed — try GitLab mirror -----------------------
+			else
+				local gl_path="${GITLAB_MIRRORS[$src]-}"
+				if [ -z "$gl_path" ]; then
+					epr "GitHub unavailable for '${src}' and no GitLab mirror is configured for it"
+					return 1
+				fi
+				pr "GitHub unavailable for '${src}' — falling back to GitLab mirror" >&2
+				local gl_rel="https://gitlab.com/api/v4/projects/${gl_path}/releases"
+
+				if [ "$ver" = "latest" ] || [ "$ver" = "dev" ]; then
+					resp=$(gl_req "${gl_rel}?per_page=1" -) || return 1
+					resp=$(jq -r '.[0]' <<<"$resp")
+				else
+					resp=$(gl_req "${gl_rel}/${ver}" -) || return 1
+				fi
+
+				tag_name=$(jq -r '.tag_name' <<<"$resp")
+				# GitLab puts assets under .assets.links[], not .assets[]
+				asset=$(jq -e -r ".assets.links[] | select(.name | endswith(\"$ext\"))" <<<"$resp") || return 1
+				url=$(jq -r .url <<<"$asset")
+				name=$(jq -r .name <<<"$asset")
+				file="${dir}/${name}"
+				gl_dl "$file" "$url" >&2 || return 1
+				echo "$tag: $(cut -d/ -f1 <<<"$src")/${name} (gitlab mirror) " >>"${cl_dir}/changelog.md"
+			fi
+			# --------------------------------------------------------------
+
 		else
 			local for_err=$file
 			if [ "$ver" = "latest" ]; then
@@ -95,6 +137,7 @@ get_rv_prebuilts() {
 			tag_name=$(cut -d'-' -f3- <<<"$name")
 			tag_name=v${tag_name%.*}
 		fi
+
 		if [ "$tag" = "Patches" ]; then
 			if [ ! -f "$file" ]; then echo -e "[Changelog](https://github.com/${src}/releases/tag/${tag_name})\n" >>"${cl_dir}/changelog.md"; fi
 			if [ "$REMOVE_RV_INTEGRATIONS_CHECKS" = true ]; then
@@ -112,6 +155,7 @@ get_rv_prebuilts() {
 				rm -r "${file}-zip" || :
 			fi
 		fi
+
 		echo -n "$file "
 	done
 	echo
@@ -197,6 +241,7 @@ _req() {
 		mv -f "$dlp" "$op"
 	fi
 }
+
 req() { _req "$1" "$2" --header="User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0"; }
 gh_req() { _req "$1" "$2" --header="$GH_HEADER"; }
 gh_dl() {
@@ -206,20 +251,32 @@ gh_dl() {
 	fi
 }
 
-log() { echo -e "$1  " >>"build.md"; }
+# GitLab helpers — public repos need no auth token
+gl_req() { _req "$1" "$2" --header="User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0"; }
+gl_dl() {
+	if [ ! -f "$1" ]; then
+		pr "Getting '$1' from '$2'"
+		_req "$2" "$1" --header="User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0"
+	fi
+}
+
+log() { echo -e "$1 " >>"build.md"; }
+
 get_highest_ver() {
 	local vers m
 	vers=$(tee)
 	m=$(head -1 <<<"$vers")
 	if ! semver_validate "$m"; then echo "$m"; else sort -rV <<<"$vers" | head -1; fi
 }
+
 semver_validate() {
 	local a="${1%-*}"
 	local ac="${a//[.0-9]/}"
 	[ ${#ac} = 0 ]
 }
+
 get_patch_last_supported_ver() {
-	local pkg_name=$1 inc_sel=$2 _exc_sel=$3 _exclusive=$4 # TODO: resolve using all of these
+	local pkg_name=$1 inc_sel=$2 _exc_sel=$3 _exclusive=$4
 	local op
 	if [ "$inc_sel" ]; then
 		if ! op=$(java -jar "$rv_cli_jar" list-patches "$rv_patches_jar" -f "$pkg_name" -v -p 2>&1 | awk '{$1=$1}1'); then
@@ -263,13 +320,11 @@ merge_splits() {
 		epr "$OP"
 		return 1
 	fi
-	# this is required because of apksig
 	mkdir "${bundle}-zip"
 	unzip -qo "${bundle}.mzip" -d "${bundle}-zip"
 	pushd "${bundle}-zip" || abort
 	zip -0rq "${CWD}/${bundle}.zip" .
 	popd || abort
-	# if building module, sign the merged apk properly
 	if isoneof "module" "${build_mode_arr[@]}"; then
 		patch_apk "${bundle}.zip" "${output}" "--exclusive" "${args[cli]}" "${args[ptjar]}"
 		local ret=$?
@@ -282,6 +337,7 @@ merge_splits() {
 }
 
 # -------------------- apkmirror --------------------
+
 apk_mirror_search() {
 	local resp="$1" dpi="$2" arch="$3" apk_bundle="$4"
 	local apparch dlurl node app_table
@@ -301,6 +357,7 @@ apk_mirror_search() {
 	done
 	return 1
 }
+
 dl_apkmirror() {
 	local url=$1 version=${2// /-} output=$3 arch=$4 dpi=$5 is_bundle=false
 	if [ -f "${output}.apkm" ]; then
@@ -323,7 +380,6 @@ dl_apkmirror() {
 		url=$(echo "$resp" | $HTMLQ --base https://www.apkmirror.com --attribute href "a.btn") || return 1
 		url=$(req "$url" - | $HTMLQ --base https://www.apkmirror.com --attribute href "span > a[rel = nofollow]") || return 1
 	fi
-
 	if [ "$is_bundle" = true ]; then
 		req "$url" "${output}.apkm"
 		merge_splits "${output}.apkm" "${output}"
@@ -331,6 +387,7 @@ dl_apkmirror() {
 		req "$url" "${output}"
 	fi
 }
+
 get_apkmirror_vers() {
 	local vers apkm_resp
 	apkm_resp=$(req "https://www.apkmirror.com/uploads/?appcategory=${__APKMIRROR_CAT__}" -)
@@ -347,6 +404,7 @@ get_apkmirror_vers() {
 		echo "$vers"
 	fi
 }
+
 get_apkmirror_pkg_name() { sed -n 's;.*id=\(.*\)" class="accent_color.*;\1;p' <<<"$__APKMIRROR_RESP__"; }
 get_apkmirror_resp() {
 	__APKMIRROR_RESP__=$(req "${1}" -)
@@ -354,11 +412,14 @@ get_apkmirror_resp() {
 }
 
 # -------------------- uptodown --------------------
+
 get_uptodown_resp() {
 	__UPTODOWN_RESP__=$(req "${1}/versions" -)
 	__UPTODOWN_RESP_PKG__=$(req "${1}/download" -)
 }
+
 get_uptodown_vers() { $HTMLQ --text ".version" <<<"$__UPTODOWN_RESP__"; }
+
 dl_uptodown() {
 	local uptodown_dlurl=$1 version=$2 output=$3 arch=$4 _dpi=$5
 	if [ "$arch" = "arm-v7a" ]; then arch="armeabi-v7a"; fi
@@ -391,23 +452,28 @@ dl_uptodown() {
 	data_url=$($HTMLQ "#detail-download-button" --attribute data-url <<<"$resp") || return 1
 	req "https://dw.uptodown.com/dwn/${data_url}" "$output"
 }
+
 get_uptodown_pkg_name() { $HTMLQ --text "tr.full:nth-child(1) > td:nth-child(3)" <<<"$__UPTODOWN_RESP_PKG__"; }
 
 # -------------------- archive --------------------
+
 dl_archive() {
 	local url=$1 version=$2 output=$3 arch=$4
 	local path version=${version// /}
 	path=$(grep "${version_f#v}-${arch// /}" <<<"$__ARCHIVE_RESP__") || return 1
 	req "${url}/${path}" "$output"
 }
+
 get_archive_resp() {
 	local r
 	r=$(req "$1" -)
 	if [ -z "$r" ]; then return 1; else __ARCHIVE_RESP__=$(sed -n 's;^<a href="\(.*\)"[^"]*;\1;p' <<<"$r"); fi
 	__ARCHIVE_PKG_NAME__=$(awk -F/ '{print $NF}' <<<"$1")
 }
+
 get_archive_vers() { sed 's/^[^-]*-//;s/-\(all\|arm64-v8a\|arm-v7a\)\.apk//g' <<<"$__ARCHIVE_RESP__"; }
 get_archive_pkg_name() { echo "$__ARCHIVE_PKG_NAME__"; }
+
 # --------------------------------------------------
 
 patch_apk() {
@@ -442,7 +508,6 @@ build_rv() {
 	local dl_from=${args[dl_from]}
 	local arch=${args[arch]}
 	local arch_f="${arch// /}"
-
 	local p_patcher_args=()
 	if [ "${args[excluded_patches]}" ]; then p_patcher_args+=("$(join_args "${args[excluded_patches]}" -d)"); fi
 	if [ "${args[included_patches]}" ]; then p_patcher_args+=("$(join_args "${args[included_patches]}" -e)"); fi
@@ -460,10 +525,12 @@ build_rv() {
 		dl_from=$dl_p
 		break
 	done
+
 	if [ -z "$pkg_name" ]; then
 		epr "empty pkg name, not building ${table}."
 		return 0
 	fi
+
 	local get_latest_ver=false
 	if [ "$version_mode" = auto ]; then
 		if ! version=$(get_patch_last_supported_ver "$pkg_name" \
@@ -477,11 +544,13 @@ build_rv() {
 		version=$version_mode
 		p_patcher_args+=("-f")
 	fi
+
 	if [ $get_latest_ver = true ]; then
 		if [ "$version_mode" = beta ]; then __AAV__="true"; else __AAV__="false"; fi
 		pkgvers=$(get_"${dl_from}"_vers)
 		version=$(get_highest_ver <<<"$pkgvers") || version=$(head -1 <<<"$pkgvers")
 	fi
+
 	if [ -z "$version" ]; then
 		epr "empty version, not building ${table}."
 		return 0
@@ -512,9 +581,11 @@ build_rv() {
 		done
 		if [ ! -f "$stock_apk" ]; then return 0; fi
 	fi
+
 	if ! check_sig "$stock_apk" "$pkg_name"; then
 		abort "apk signature mismatch '$stock_apk'"
 	fi
+
 	log "${table}: ${version}"
 
 	local microg_patch
@@ -529,6 +600,7 @@ build_rv() {
 	local rv_brand_f=${args[rv_brand],,}
 	rv_brand_f=${rv_brand_f// /-}
 	if [ "${args[patcher_args]}" ]; then p_patcher_args+=("${args[patcher_args]}"); fi
+
 	for build_mode in "${build_mode_arr[@]}"; do
 		patcher_args=("${p_patcher_args[@]}")
 		pr "Building '${table}' in '$build_mode' mode"
@@ -542,6 +614,7 @@ build_rv() {
 		else
 			patched_apk="${TEMP_DIR}/${app_name_l}-${rv_brand_f}-${version_f}-${arch_f}.apk"
 		fi
+
 		if [ "${args[riplib]}" = true ]; then
 			patcher_args+=("--rip-lib x86_64 --rip-lib x86")
 			if [ "$build_mode" = module ]; then
@@ -554,23 +627,25 @@ build_rv() {
 				fi
 			fi
 		fi
+
 		if [ "${NORB:-}" != true ] || [ ! -f "$patched_apk" ]; then
 			if ! patch_apk "$stock_apk" "$patched_apk" "${patcher_args[*]}" "${args[cli]}" "${args[ptjar]}"; then
 				epr "Building '${table}' failed!"
 				return 0
 			fi
 		fi
+
 		if [ "$build_mode" = apk ]; then
 			local apk_output="${BUILD_DIR}/${app_name_l}-${rv_brand_f}-v${version_f}-${arch_f}.apk"
 			mv -f "$patched_apk" "$apk_output"
 			pr "Built ${table} (non-root): '${apk_output}'"
 			continue
 		fi
+
 		local base_template
 		base_template=$(mktemp -d -p "$TEMP_DIR")
 		cp -a $MODULE_TEMPLATE_DIR/. "$base_template"
 		local upj="${table,,}-update.json"
-
 		module_config "$base_template" "$pkg_name" "$version" "$arch"
 		module_prop \
 			"${args[module_prop_name]}" \
@@ -579,7 +654,6 @@ build_rv() {
 			"${app_name} ${args[rv_brand]} Magisk module" \
 			"https://raw.githubusercontent.com/${GITHUB_REPOSITORY-}/update/${upj}" \
 			"$base_template"
-
 		local module_output="${app_name_l}-${rv_brand_f}-magisk-v${version_f}-${arch_f}.zip"
 		pr "Packing module ${table}"
 		cp -f "$patched_apk" "${base_template}/base.apk"
@@ -605,6 +679,7 @@ module_config() {
 PKG_VER=$3
 MODULE_ARCH=$ma" >"$1/config"
 }
+
 module_prop() {
 	echo "id=${1}
 name=${2}
@@ -612,6 +687,5 @@ version=v${3} (${NEXT_VER_CODE})
 versionCode=${NEXT_VER_CODE}
 author=j-hc
 description=${4}" >"${6}/module.prop"
-
 	if [ "$ENABLE_MAGISK_UPDATE" = true ]; then echo "updateJson=${5}" >>"${6}/module.prop"; fi
 }
